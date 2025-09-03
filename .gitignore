@@ -1,0 +1,9 @@
+.venv/
+browser_data/
+.env
+test.ipynb
+*.ipynb
+human_approval.py
+*.json
+
+__pycache__/
