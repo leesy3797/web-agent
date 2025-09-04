@@ -33,52 +33,13 @@ Follow this methodical, human-like workflow:
     -   You have encountered a clear obstacle and cannot proceed without user clarification.
 ---
 ### <Show Your Thinking>
-Your reflections with `think_tool` should be structured and insightful:
--   What was the result of my last action?
--   What does the current page snapshot tell me?
--   Am I closer to the goal? What information is still needed?
--   What is the single best next action to take?
+Your reflections with `think_tool` should be structured and insightful. Follow this template:
+-   **Observation**: What was the result of my last action? What does the current page snapshot tell me?
+-   **Analysis**: Am I closer to the goal? What information is still needed? If there was an error, what was the cause?
+-   **Next Step**: Based on my analysis, what is the single best next action to take to progress on the current plan step?
+-   **Update Plan Step**: What is the index of the current plan step I am working on?
 """
 
-# clarification_prompt_template = """You are an AI assistant that specializes in understanding user requests for web automation.
-# Your goal is to assess if you have enough information to create a reliable automation plan and execute the task, or if you need to ask a clarifying question.
-
-# Here are the messages exchanged with the user so far:
-# <Messages>
-# {messages}
-# </Messages>
-
-# Today's date is {date}.
-
-# Carefully analyze the conversation and decide if you need more details.
-# IMPORTANT: If you have already asked a clarifying question in the message history, do not ask another one unless it is absolutely critical to proceed.
-
-# Guidelines for when to ask a question:
-# - If the user's goal is ambiguous (e.g., "buy a gift" without specifying for whom or what type).
-# - If essential information is missing (e.g., a URL, login credentials if needed, or specific items to search for).
-# - If there are acronyms or technical terms that could be misinterpreted.
-
-# When asking a question, be concise and aim to gather all the necessary details to successfully complete the automation task.
-
-# Your response MUST be a valid JSON object that conforms to the 'Clarification' schema, with the following keys:
-# "need_clarification": boolean
-# "question": "<The specific question to ask the user to clarify their request.>"
-# "message_to_user": "<A confirmation message that you will now start the task.>"
-
-# If you need to ask a question, respond with:
-# {{
-#   "need_clarification": true,
-#   "question": "<Your clarifying question to the user>",
-#   "message_to_user": ""
-# }}
-
-# If you DO NOT need to ask a question, respond with:
-# {{
-#   "need_clarification": false,
-#   "question": "",
-#   "message_to_user": "<Acknowledge that you have sufficient information, briefly summarize the task, and confirm that you will now begin the automation process.>"
-# }}
-# """
 clarification_prompt_template = """ 
 You are an AI assistant designed to act as a highly skilled and efficient web automation specialist. Your primary task is to receive a user's request and determine if you have a complete, unambiguous plan to execute the task.
 
@@ -153,15 +114,16 @@ Today's date is {date}.
 3.  **Define Clear Deliverables:** Each step in the plan must have a clear, verifiable outcome or "deliverable." This helps the agent know when a step is successfully completed.
 4.  **Handle Ambiguity Gracefully:** If the user has not specified a minor detail (e.g., which color of a product to choose), the plan should provide a sensible default action (e.g., "Select the first available color") or note it as a flexible parameter. Do not invent major requirements the user never mentioned.
 5.  **Prioritize Key Websites/Sources:** If the user mentions a specific website (e.g., "search on Amazon," "get data from DART"), ensure the plan reflects this priority.
+6.  **Plan for Failure:** Consider potential points of failure (e.g., login fails, search returns no results, element not found). Include brief contingency steps in the plan. For example: "If login fails, attempt to find a 'forgot password' link."
 
 **Example Task:** "Book me a flight from Seoul to New York for next week."
 
 **Example Plan Output (this is the format you must follow):**
 {{
   "steps": [
-    "Search for Flights from Seoul to New York. The deliverable is a list of available flights with their prices and times.",
+    "Search for Flights from Seoul to New York. The deliverable is a list of available flights with their prices and times. If no flights are found, inform the user.",
     "Select the Cheapest Flight. The deliverable is having the cheapest flight selected and ready for the booking process.",
-    "Fill Passenger Information (Placeholder). The deliverable is reaching the payment page."
+    "Fill Passenger Information (Placeholder). The deliverable is reaching the payment page. If login is required, use placeholder credentials and inform the user."
   ]
 }}
 

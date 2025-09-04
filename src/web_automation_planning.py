@@ -66,16 +66,15 @@ def clarify_with_user(state: AgentState) -> Command[Literal["planning_automation
     console.print(f"[dim]Message: {response.message_to_user}[/dim]")
 
     if response.need_clarification:
-        console.print(Panel("[bold red]❌ Need clarification - Routing back to self[/bold red]", border_style="red"))
+        console.print(Panel("[bold red]❌ Need clarification - Ask Users for supplementary informations[/bold red]", border_style="red"))
         # We return a Command to send the message to the user and interrupt the workflow
         # The user's reply will then go back to this same node.
         console.print(Panel(f"[bold yellow]Question: {response.question}[/bold yellow]", border_style="red"))
-        answer = Prompt.ask(f"You")
+        answer = Prompt.ask(f"[bold]You[/bold]")
         return Command(
             goto="clarify_with_user",
             update={
                 "messages": [AIMessage(content=response.question), HumanMessage(content=answer)],
-                "need_clarification": True
             }
         )
     else:
@@ -84,7 +83,6 @@ def clarify_with_user(state: AgentState) -> Command[Literal["planning_automation
             goto="planning_automation", 
             update={
                 "messages": [AIMessage(content=response.message_to_user)],
-                "need_clarification": False,
             }
         )
 
@@ -117,25 +115,25 @@ def human_approval(state: AgentState) -> Command[Literal["planning_automation", 
         return Command(
             goto="planning_automation",
             update={
-                "messages": [AIMessage(content="User did not approve the plan. Planning again according to the user's feedback.")],
+                "messages": [
+                    AIMessage(content="User did not approve the plan."),
+                    HumanMessage(content=f"User feedback for replanning: {feedback}")
+                ],
             }
         )
     else:
         # console.print(Panel("[bold red]Invalid input. Do you want to Quit Agent?[/bold red]", border_style="red"))
-        answer = Prompt.ask("Do you want to Quit Agent? (yes/no)", choices=["yes", "no"], default="no")
+        answer = Prompt.ask("[bold red]Do you want to Quit Agent? (yes/no)[/bold red]", choices=["yes", "no"], default="no")
         if answer.lower() == "yes":
             return Command(
                 goto=END,
                 update={
-                    "messages": [AIMessage(content="Invalid input received.")],
+                    "messages": [AIMessage(content="Invalid input received. Maybe user wants to quit Agent.")],
                 }
             )
         else:
             return Command(
-                goto="planning_automation",
-                update={
-                    "messages": [AIMessage(content="Invalid input received.")],
-                }
+                goto="human_approval"
             )
 
 def planning_automation(state: AgentState):
