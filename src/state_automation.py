@@ -54,6 +54,9 @@ class AgentState(MessagesState):
     # A summary of the agent's execution process, explaining 'how' the task was completed.
     workflow_summary: str
 
+    # Maximum number of recent messages to include in agent context (for MAX_TOKENS handling)
+    max_messages_for_agent: Optional[int] = 5
+
 # ===== STRUCTURED OUTPUT SCHEMAS =====
 
 class Clarification(BaseModel):

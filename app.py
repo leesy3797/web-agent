@@ -116,7 +116,8 @@ def save_agent_state(state: AgentState, filename: str = "agent_state.json"):
             "last_error": state.get("last_error"),
             "extracted_data": state.get("extracted_data"),
             "final_answer": state.get("final_answer"),
-            "workflow_summary": state.get("workflow_summary")
+            "workflow_summary": state.get("workflow_summary"),
+            "max_messages_for_agent": state.get("max_messages_for_agent", 5)
         }
         with open(filename, "w", encoding='utf-8') as f:
             json.dump(serializable_state, f, indent=4, ensure_ascii=False)
@@ -225,23 +226,78 @@ async def agent_node(state: AgentState, model_with_tools):
         )
     guidance = (
         "You must strictly follow the current plan step only.\n"
-        "- Current plan index (0-based): {}\n"
+        "- Current plan index(0-based): {}\n"
         "- Current plan step: {}\n"
         "- Full plan (for reference only, do NOT execute future steps now):\n{}\n\n"
         "Constraints:\n"
         "1) Only perform actions necessary to achieve the deliverable of the CURRENT step.\n"
         "2) Do NOT pre-emptively execute later steps.\n"
-        "3) After any browser action, call browser_snapshot, then call think_tool to reflect.\n"
-        "4) When the CURRENT step's deliverable is satisfied, use think_tool and set current_plan_step to the next index.\n"
-        "5) If the page state is unclear, prefer observation (browser_snapshot) before action.\n"
+        "3) When the CURRENT step's deliverable is satisfied, use think_tool and set current_plan_step to the next index.\n"
+        "4) Do NOT generate a final answer until all steps in the Full plan are completed.\n"
     ).format(
         int(step_index),
         plan[step_index] if plan and step_index < len(plan) else "N/A",
         "\n".join([f"  - {i+1}. {s}" for i, s in enumerate(plan)])
     )
+    
+    # 토큰 이슈 대응: 점진적 메시지 축소
+    max_messages = state.get("max_messages_for_agent", 5)  # 기본값 5개 (뒤에서 5개)
+    messages = state.get('messages', [])
+    
+    # 이전에 MAX_TOKENS 이슈가 있었는지 확인
+    last_msg = messages[-1] if messages else None
+    if (last_msg and hasattr(last_msg, 'response_metadata') and 
+        last_msg.response_metadata and 
+        last_msg.response_metadata.get('finish_reason') == 'MAX_TOKENS'):
+        
+        # 메시지 수를 점진적으로 줄임 (5 -> 4 -> 3 -> 2 -> 1)
+        max_messages = max(1, max_messages - 1)
+        console.print(Panel(f"[bold yellow]🔧 Reducing context to {max_messages} messages due to MAX_TOKENS[/bold yellow]", border_style="yellow"))
+    
+    recently_executed = []
+    recent_messages = messages[-max_messages:]
+    
+    for i, msg in enumerate(recent_messages):
+        is_last_message = (i == len(recent_messages) - 1)
+        
+        if msg.type == 'human':
+            recently_executed.append(f"Human : {msg.content}")
+        elif msg.type == 'ai':
+            if msg.tool_calls:
+                recently_executed.append(f"AI(tool) : {msg.content} / Tool Usage : {[f"{tool_call["name"]} ({tool_call["args"]})" for tool_call in msg.tool_calls]}")
+            else:
+                recently_executed.append(f"AI : {msg.content}")
+        elif msg.type == 'system':
+            recently_executed.append(f"System : {msg.content}")
+        elif msg.type == 'tool': 
+            # 마지막 메시지가 아니고 내용이 너무 길면 제외
+            if not is_last_message and len(msg.content) > 1000:
+                continue # 너무 긴 툴 출력은 제외 (예: browser_snapshot)
+            recently_executed.append(f"AI(tool) :  {msg.content}")
+    
 
-    model_input_messages = list(state["messages"]) + [SystemMessage(content=guidance)]
+    
+    recent_history = "Below is the recent history:\n\n" + "\n".join(recently_executed)
+    model_input_messages = [
+        SystemMessage(content=guidance), 
+        SystemMessage(content=command_prompt),
+        HumanMessage(content=recent_history)
+    ]
+    
     response = await model_with_tools.ainvoke(model_input_messages)
+    
+    # MAX_TOKENS 이슈가 발생했는지 확인하고 max_messages_for_agent 업데이트
+    if (hasattr(response, 'response_metadata') and 
+        response.response_metadata and 
+        response.response_metadata.get('finish_reason') == 'MAX_TOKENS'):
+        console.print(Panel(f"[bold red]⚠️ MAX_TOKENS detected, will reduce context further next time[/bold red]", border_style="red"))
+        return {"messages": [response], "max_messages_for_agent": max_messages}
+    
+    # 성공적으로 응답을 받았으면 메시지 수를 원래대로 복구 (바로 5개로 리셋)
+    if max_messages < 5:
+        console.print(Panel(f"[bold green]✅ Response successful, resetting context to 5 messages[/bold green]", border_style="green"))
+        return {"messages": [response], "max_messages_for_agent": 5}
+    
     return {"messages": [response]}
 
 
@@ -270,10 +326,19 @@ async def tool_node(state: AgentState, tool_executor: ToolExecutor):
 
 
 def should_continue(state: AgentState):
-    if not state["messages"][-1].tool_calls:
-        return "end"
-    else:
-        return "continue"
+    last_msg = state["messages"][-1]
+    # 1) 마지막 AI 메시지가 도구 호출을 포함하면 tools로 이동
+    if getattr(last_msg, "tool_calls", None):
+        return "tools"
+    
+    # 2) 도구 호출이 없더라도 계획이 남아있다면 agent로 다시 루프
+    plan = state.get("plan", [])
+    current_step = int(state.get("current_plan_step", 0) or 0)
+    if plan and current_step < len(plan):
+        return "agent"
+    
+    # 3) 더 진행할 작업이 없으면 종료
+    return "end"
 
 def get_command_destination(node_result) -> str:
     # node_result는 노드의 반환값이며, Command일 경우 해당 goto로 라우팅
@@ -341,7 +406,8 @@ async def main():
             "agent", 
             should_continue, 
             {
-                "continue": "tools", 
+                "tools": "tools",
+                "agent": "agent",
                 "end": END
             }
         )
@@ -349,7 +415,10 @@ async def main():
         app = workflow.compile()
         console.print(Panel("[bold green]Web Automation Agent is ready.[/bold green]", title="🤖 Agent Ready"))
 
+        RESUME = False
+
         current_state = load_agent_state()
+
         if current_state:
             console.print(Panel("[bold]이전 작업 내용:[/bold]\n[dim]Task: {task}\nPlan: {plan}[/dim]".format(
                 task=current_state.get('task', 'N/A'),
@@ -358,6 +427,8 @@ async def main():
             resume = Prompt.ask("이전 작업을 이어서 진행하시겠습니까?", choices=["yes", "no"], default="yes")
             if resume.lower() == "no":
                 current_state = None
+            else:
+                RESUME = True
         if not current_state:
             current_state = {
                 "messages" : [SystemMessage(content=command_prompt)],
@@ -365,13 +436,18 @@ async def main():
                 "extracted_data": {},
                 "current_plan_step": 0,
                 "plan": [],
+                "max_messages_for_agent": 5,
             }
 
         while True:
-            console.print(Panel("[bold]Please enter your request (type 'exit' or 'quit' to stop):[/bold]", border_style="blue"))
-            user_input = Prompt.ask("[bold]You[/bold]")
-            if user_input.lower() in ["exit", "quit"]:
-                break
+            if not RESUME:
+                console.print(Panel("[bold]Please enter your request (type 'exit' or 'quit' to stop):[/bold]", border_style="blue"))
+                user_input = Prompt.ask("[bold]You[/bold]")
+                if user_input.lower() in ["exit", "quit"]:
+                    break
+            else:
+                user_input = None
+                RESUME = False
 
             if user_input:
                 if not current_state.get("task"):
@@ -381,66 +457,66 @@ async def main():
                     HumanMessage(content = user_input)
                 )
 
-                try:
-                    async for event in app.astream(current_state, {"recursion_limit": 20}):
-                        # 각 노드에서 반환된 업데이트를 current_state에 병합
-                        for _, node_update in event.items():
-                            if not isinstance(node_update, dict):
-                                continue
-                            for field_name, field_value in node_update.items():
-                                if field_name == "messages" and isinstance(field_value, list):
-                                    current_state.setdefault("messages", []).extend(field_value)
-                                elif field_name == "action_history" and isinstance(field_value, list):
-                                    current_state.setdefault("action_history", []).extend(field_value)
-                                elif field_name == "extracted_data" and isinstance(field_value, dict):
-                                    current_state.setdefault("extracted_data", {}).update(field_value)
-                                else:
-                                    current_state[field_name] = field_value
+            try:
+                async for event in app.astream(current_state, {"recursion_limit": 20}):
+                    # 각 노드에서 반환된 업데이트를 current_state에 병합
+                    for _, node_update in event.items():
+                        if not isinstance(node_update, dict):
+                            continue
+                        for field_name, field_value in node_update.items():
+                            if field_name == "messages" and isinstance(field_value, list):
+                                current_state.setdefault("messages", []).extend(field_value)
+                            elif field_name == "action_history" and isinstance(field_value, list):
+                                current_state.setdefault("action_history", []).extend(field_value)
+                            elif field_name == "extracted_data" and isinstance(field_value, dict):
+                                current_state.setdefault("extracted_data", {}).update(field_value)
+                            else:
+                                current_state[field_name] = field_value
 
-                        # 이벤트 병합 후 저장
-                        save_agent_state(current_state)
+                    # 이벤트 병합 후 저장
+                    save_agent_state(current_state)
 
-                    # 마지막 응답 선택: 가장 최근 AI 메시지 우선, 없으면 마지막 메시지
-                    final_msg = None
-                    for msg in reversed(current_state["messages"]):
-                        if isinstance(msg, AIMessage):
-                            final_msg = msg
-                            break
-                    if final_msg is None and current_state["messages"]:
-                        final_msg = current_state["messages"][-1]
+                # 마지막 응답 선택: 가장 최근 AI 메시지 우선, 없으면 마지막 메시지
+                final_msg = None
+                for msg in reversed(current_state["messages"]):
+                    if isinstance(msg, AIMessage):
+                        final_msg = msg
+                        break
+                if final_msg is None and current_state["messages"]:
+                    final_msg = current_state["messages"][-1]
 
-                    if final_msg and getattr(final_msg, "content", None):
-                        console.print(Panel(f"[bold green]🤖 Agent:[/bold green]\n{final_msg.content}", border_style="green"))
+                if final_msg and getattr(final_msg, "content", None):
+                    console.print(Panel(f"[bold green]🤖 Agent:[/bold green]\n{final_msg.content}", border_style="green"))
+            
+            except GraphRecursionError as e:
+                console.print(
+                    Panel(f"[bold red]❌ I'm sorry. The task was interrupted because the recursion limit was reached.[/bold red]", border_style="red")
+                )
+                # Generate a summary of the current state for the user
+                summary = summarize_agent_state(current_state)
                 
-                except GraphRecursionError as e:
-                    console.print(
-                        Panel(f"[bold red]❌ I'm sorry. The task was interrupted because the recursion limit was reached.[/bold red]", border_style="red")
-                    )
-                    # Generate a summary of the current state for the user
-                    summary = summarize_agent_state(current_state)
-                    
-                    final_response = model.invoke(
-                        [
-                            SystemMessage(
-                                content=f"""
-                                You are an AI assistant specialized in completing user tasks. A technical error has interrupted the current task, and you cannot proceed. Your new objective is to inform the user about this issue in a clear, helpful, and transparent manner.
+                final_response = model.invoke(
+                    [
+                        SystemMessage(
+                            content=f"""
+                            You are an AI assistant specialized in completing user tasks. A technical error has interrupted the current task, and you cannot proceed. Your new objective is to inform the user about this issue in a clear, helpful, and transparent manner.
 
-                                    Your response MUST follow these steps:
-                                    1.  **Acknowledge the Interruption:** Start by politely informing the user that the task could not be fully completed due to a technical issue. Be friendly and apologetic.
-                                    2.  **Report Progress:** Based on the provided summary of the agent's state, detail what has been successfully accomplished so far. Specifically, extract and highlight any final, actionable information that was found. For example, if the task was to find a movie to book, clearly state the movie title, showtime, and any other relevant details that were successfully retrieved.
-                                    3.  **Explain the Point of Failure:** Briefly and in plain language, explain where the process was interrupted (e.g., "영화를 찾는 데는 성공했지만, 예약 과정에서 문제가 발생했습니다" or "원하시는 정보를 찾았으나, 다음 단계로 진행할 수 없었습니다").
-                                    4.  **Offer Next Steps:** End by apologizing for the inconvenience and offering to assist with a new task. Your goal is to provide a complete, standalone message that is helpful despite the failure.
-                                    5.  **Maintain a Friendly and Non-technical Tone:** Avoid jargon. Your entire response should be a single, coherent message to the user, not a list of raw data.
-                                    6.  **You Must answer in Korean.**
-                               """
-                            ), 
-                            HumanMessage(
-                                content=summary
-                            )
-                        ]
-                    )
-                    # Output the summary to the user
-                    console.print(Panel(f"[bold green]🤖 Agent:[/bold green]\n{final_response.content}", border_style="green"))
+                                Your response MUST follow these steps:
+                                1.  **Acknowledge the Interruption:** Start by politely informing the user that the task could not be fully completed due to a technical issue. Be friendly and apologetic.
+                                2.  **Report Progress:** Based on the provided summary of the agent's state, detail what has been successfully accomplished so far. Specifically, extract and highlight any final, actionable information that was found. For example, if the task was to find a movie to book, clearly state the movie title, showtime, and any other relevant details that were successfully retrieved.
+                                3.  **Explain the Point of Failure:** Briefly and in plain language, explain where the process was interrupted (e.g., "영화를 찾는 데는 성공했지만, 예약 과정에서 문제가 발생했습니다" or "원하시는 정보를 찾았으나, 다음 단계로 진행할 수 없었습니다").
+                                4.  **Offer Next Steps:** End by apologizing for the inconvenience and offering to assist with a new task. Your goal is to provide a complete, standalone message that is helpful despite the failure.
+                                5.  **Maintain a Friendly and Non-technical Tone:** Avoid jargon. Your entire response should be a single, coherent message to the user, not a list of raw data.
+                                6.  **You Must answer in Korean.**
+                            """
+                        ), 
+                        HumanMessage(
+                            content=summary
+                        )
+                    ]
+                )
+                # Output the summary to the user
+                console.print(Panel(f"[bold green]🤖 Agent:[/bold green]\n{final_response.content}", border_style="green"))
 
 if __name__ == "__main__":
     try:

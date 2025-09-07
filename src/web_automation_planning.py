@@ -52,6 +52,15 @@ def clarify_with_user(state: AgentState) -> Command[Literal["planning_automation
     console.print(Panel(f"[bold blue]🔍 Clarification Node - Processing...[/bold blue]", border_style="blue"))
     console.print(f"[dim]Current state keys: {list(state.keys())}[/dim]")
     
+    # if state.get("plan", None):
+    #     console.print(Panel("[bold green]✅ Plan already exists - Routing to planning_automation[/bold green]", border_style="green"))
+    #     return Command(
+    #         goto="agent", 
+    #         update={
+    #             "messages": [AIMessage(content="Plan already exists. Proceeding to Agent right away.")],
+    #         }
+    #     )
+    
     structured_output_model = model.with_structured_output(Clarification)
 
     response = structured_output_model.invoke([
