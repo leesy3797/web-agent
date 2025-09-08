@@ -63,22 +63,32 @@ async def get_mcp_client() -> MultiServerMCPClient:
         console.print("[green]✓ MCP client started successfully![/green]")
     return _client
 
-
-@tool(parse_docstring=True)
-def think_tool(reflection: str, current_plan_step: int) -> str:
+@tool
+def finish_step(reason: str) -> str:
     """
-    Tool for strategically reflecting on the progress of a web automation task and deciding the next action.
-
+    Call this tool to signal that the current step of the plan is complete.
     Args:
-        reflection: Your detailed thoughts on the webpage state, task progress, obstacles, and the next action plan.
-                    You should structure your reflection to include your observation, analysis, and a proposed next step.
-        current_plan_step: The index (0-based) of the current step in the plan you are working on.
-    
+        reason: A brief explanation of why you believe the step is complete.
     Returns:
-        A confirmation that the reflection has been recorded to inform the next decision.
+        A confirmation that the step has been marked as complete.
     """
-    console.print(Panel(f"[bold yellow]🤔 Agent's Reflection:[/bold yellow]\n{reflection}", border_style="yellow"))
-    return f"Reflection recorded. Currently on plan step {current_plan_step}."
+    return f"Step marked as complete. Reason: {reason}"
+
+# @tool(parse_docstring=True)
+# def think_tool(reflection: str, current_plan_step: int) -> str:
+#     """
+#     Tool for strategically reflecting on the progress of a web automation task and deciding the next action.
+
+#     Args:
+#         reflection: Your detailed thoughts on the webpage state, task progress, obstacles, and the next action plan.
+#                     You should structure your reflection to include your observation, analysis, and a proposed next step.
+#         current_plan_step: The index (0-based) of the current step in the plan you are working on.
+    
+#     Returns:
+#         A confirmation that the reflection has been recorded to inform the next decision.
+#     """
+#     console.print(Panel(f"[bold yellow]🤔 Agent's Reflection:[/bold yellow]\n{reflection}", border_style="yellow"))
+#     return f"Reflection recorded. Currently on plan step {current_plan_step}."
 
 @tool(parse_docstring=True)
 def extracted_data_tool(data_to_extract: dict) -> str:
@@ -105,7 +115,8 @@ async def setup_tools():
     client = await get_mcp_client()
     console.print(Panel("[bold yellow]Getting tools....[/bold yellow]", expand=False))
     mcp_tools = await client.get_tools()   # 동일 세션에서 툴 로드
-    all_tools = mcp_tools + [think_tool, extracted_data_tool]
+    # all_tools = mcp_tools + [think_tool, extracted_data_tool]
+    all_tools = mcp_tools + [extracted_data_tool, finish_step]
     return all_tools
 
 def show_tools_table(all_tools) -> List:
@@ -119,31 +130,31 @@ def show_tools_table(all_tools) -> List:
     console.print(f"[bold green]✓ Successfully retrieved {len(all_tools)} tools[/bold green]")
 
 # --- 상태 저장/불러오기 헬퍼 함수 ---
+# app.py - 수정된 코드
+
 def save_agent_state(state: AgentState, filename: str = "agent_state.json"):
     """
     AgentState 객체를 JSON 직렬화 가능한 형태로 변환하여 파일로 저장합니다.
     """
     try:
-        # AgentState에서 JSON 직렬화 불가능한 객체를 변환
         serializable_state = {
             "task": state.get("task"),
-            # LangChain 메시지 객체를 dict 형태로 변환
             "messages": [m.model_dump() for m in state.get("messages", [])],
-            "plan": state.get("plan"),\
+            "plan": state.get("plan"),
             "current_plan_step": state.get("current_plan_step"),
             "action_history": state.get("action_history"),
             "last_error": state.get("last_error"),
             "extracted_data": state.get("extracted_data"),
             "final_answer": state.get("final_answer"),
             "workflow_summary": state.get("workflow_summary"),
-            "max_messages_for_agent": state.get("max_messages_for_agent", 5)
+            "max_messages_for_agent": state.get("max_messages_for_agent", 5),
+            # --- 이 줄을 추가해야 합니다! ---
+            "last_snapshot": state.get("last_snapshot")
         }
         with open(filename, "w", encoding='utf-8') as f:
             json.dump(serializable_state, f, indent=4, ensure_ascii=False)
-        # print(f"Agent state successfully saved to {filename}")
     except TypeError as e:
         print(f"Error saving state: {e}")
-
 
 def load_agent_state() -> AgentState or None:
     """JSON 파일에서 AgentState를 불러오기"""
@@ -166,6 +177,7 @@ def load_agent_state() -> AgentState or None:
                     messages.append(SystemMessage(**msg_data))
 
             loaded_data["messages"] = messages
+    
             console.print(Panel("[bold green]✓ 이전 작업 상태를 성공적으로 불러왔습니다.[/bold green]", border_style="green"))
             return loaded_data
     except Exception as e:
@@ -232,167 +244,163 @@ class ToolExecutor:
 #     messages: Annotated[list[AnyMessage], operator.add]
 
 
+# app.py
+
 async def agent_node(state: AgentState, model_with_tools):
     plan = state.get("plan", [])
     step_index = state.get("current_plan_step", 0)
     if plan and step_index < len(plan):
         console.print(
             Panel(
-                f"Current Step ({step_index + 1}/{len(plan)}): [bold cyan]{plan[step_index]}[/bold cyan]", 
-                title = "🚀 Executing Plan", 
+                f"Current Step ({step_index + 1}/{len(plan)}): [bold cyan]{plan[step_index]}[/bold cyan]",
+                title="🚀 Executing Plan",
                 border_style="cyan"
             )
         )
     guidance = (
-        "You must strictly follow the current plan step only.\n"
-        "- Current plan index(0-based): {}\n"
-        "- Current plan step: {}\n"
-        "- Full plan (for reference only, do NOT execute future steps now):\n{}\n\n"
-        "Constraints:\n"
-        "1) Only perform actions necessary to achieve the deliverable of the CURRENT step.\n"
-        "2) Do NOT pre-emptively execute later steps.\n"
-        "3) When the CURRENT step's deliverable is satisfied, use think_tool and set current_plan_step to the next index.\n"
-        "4) Do NOT generate a final answer until all steps in the Full plan are completed.\n"
+        "You are a web automation expert. Your goal is to execute a multi-step plan.\n"
+        "Analyze the user's request and the current page snapshot to determine the single best tool call to make progress on the current plan step.\n\n"
+        "## Current Plan\n"
+        "- Current step index (0-based): {step_index}\n"
+        "- Current step description: {step_description}\n"
+        "- Full plan for reference:\n{full_plan}\n\n"
+        "## Constraints\n"
+        "1. **FOCUS ON ONE STEP**: Only execute actions for the CURRENT step. Do not move to the next step prematurely.\n"
+        "2. **ANALYZE and ACT**: After observing a `browser_snapshot`, you MUST call an action tool (e.g., `browser_click`, `extracted_data_tool`) to interact with the page or extract information. Do not call `browser_snapshot` again without acting first.\n"
+        "3. **FINISH THE STEP**: Once you believe the deliverable for the current step is complete, you MUST call the `finish_step` tool to move to the next plan step."
     ).format(
-        int(step_index),
-        plan[step_index] if plan and step_index < len(plan) else "N/A",
-        "\n".join([f"  - {i+1}. {s}" for i, s in enumerate(plan)])
+        step_index=int(step_index),
+        step_description=plan[step_index] if plan and step_index < len(plan) else "N/A",
+        full_plan="\n".join([f"  - {i+1}. {s}" for i, s in enumerate(plan)])
     )
-    
-    # 토큰 이슈 대응: 점진적 메시지 축소
-    max_messages = state.get("max_messages_for_agent", 5)  # 기본값 5개 (뒤에서 5개)
+
+    # 토큰 이슈 대응: 점진적 메시지 축소 (기존 코드와 동일)
+    max_messages = state.get("max_messages_for_agent", 5)
     messages = state.get('messages', [])
-    
-    # 이전에 MAX_TOKENS 이슈가 있었는지 확인
     last_msg = messages[-1] if messages else None
-    if (last_msg and hasattr(last_msg, 'response_metadata') and 
-        last_msg.response_metadata and 
+    if (last_msg and hasattr(last_msg, 'response_metadata') and
+        last_msg.response_metadata and
         last_msg.response_metadata.get('finish_reason') == 'MAX_TOKENS'):
-        
-        # 메시지 수를 점진적으로 줄임 (5 -> 4 -> 3 -> 2 -> 1)
         max_messages = max(1, max_messages - 1)
         console.print(Panel(f"[bold yellow]🔧 Reducing context to {max_messages} messages due to MAX_TOKENS[/bold yellow]", border_style="yellow"))
-    
-    last_snapshot = state.get('last_snapshot')
-    
+
     recently_executed = []
     recent_messages = messages[-max_messages:]
-    
+
     for i, msg in enumerate(recent_messages):
         is_last_message = (i == len(recent_messages) - 1)
-        
         if msg.type == 'human':
             recently_executed.append(f"Human : {msg.content}")
         elif msg.type == 'ai':
             if msg.tool_calls:
-                recently_executed.append(f"AI(tool) : {msg.content} / Tool Usage : {[f"{tool_call["name"]} ({tool_call["args"]})" for tool_call in msg.tool_calls]}")
+                recently_executed.append(f"AI(tool) : {msg.content} / Tool Usage : {[f'{tool_call['name']} ({tool_call['args']})' for tool_call in msg.tool_calls]}")
             else:
                 recently_executed.append(f"AI : {msg.content}")
         elif msg.type == 'system':
             recently_executed.append(f"System : {msg.content}")
-        elif msg.type == 'tool': 
-            # 마지막 메시지가 아니고 내용이 너무 길면 제외
+        elif msg.type == 'tool':
             if not is_last_message and len(msg.content) > 1000:
-                continue # 너무 긴 툴 출력은 제외 (예: browser_snapshot)
-            recently_executed.append(f"AI(tool) :  {msg.content}")
-    
+                continue
+            recently_executed.append(f"Tool Output : {msg.content}")
+
     recent_history = "Below is the recent history:\n\n" + "\n".join(recently_executed)
-    
+
+    # === 스냅샷 주입 및 소비 로직 ===
+    last_snapshot = state.get("last_snapshot")
     if last_snapshot:
-        console.print(Panel("[bold cyan] injecting snapshot into context...[/bold cyan]", border_style="cyan"))
-        recent_history += f"\n\nHere is the current browser snapshot:\n<snapshot>\n{last_snapshot}\n</snapshot>"
+        console.print(Panel("[bold cyan]Injecting snapshot into context for this turn...[/bold cyan]", border_style="cyan"))
+        recent_history += f"\n\nHere is the current browser snapshot for your analysis:\n<snapshot>\n{last_snapshot}\n</snapshot>"
 
     model_input_messages = [
-        SystemMessage(content=guidance), 
+        SystemMessage(content=guidance),
         SystemMessage(content=command_prompt),
         HumanMessage(content=recent_history)
     ]
-    
+
     response = await model_with_tools.ainvoke(model_input_messages)
-    
+
     # === 반환 값에 last_snapshot 초기화 추가 ===
-    # 스냅샷을 한 번 사용했으므로 상태에서 비워줍니다.
     updates_to_return = {"messages": [response]}
     if last_snapshot:
         updates_to_return["last_snapshot"] = None
-    
-    # MAX_TOKENS 이슈 처리
-    if (hasattr(response, 'response_metadata') and 
-        response.response_metadata and 
+
+    # MAX_TOKENS 이슈 처리 (기존 코드와 동일)
+    if (hasattr(response, 'response_metadata') and
+        response.response_metadata and
         response.response_metadata.get('finish_reason') == 'MAX_TOKENS'):
         console.print(Panel(f"[bold red]⚠️ MAX_TOKENS detected, will reduce context further next time[/bold red]", border_style="red"))
         updates_to_return["max_messages_for_agent"] = max_messages
         return updates_to_return
-    
-    # 성공 시 메시지 수 복구
+
+    # 성공 시 메시지 수 복구 (기존 코드와 동일)
     if max_messages < 5:
         console.print(Panel(f"[bold green]✅ Response successful, resetting context to 5 messages[/bold green]", border_style="green"))
         updates_to_return["max_messages_for_agent"] = 5
-        return updates_to_return
-    
+
     return updates_to_return
 
 
 async def tool_node(state: AgentState, tool_executor: ToolExecutor):
     """
-    Executes tools and handles state updates for special tools like
-    browser_snapshot and extracted_data_tool.
+    도구를 실행하고 browser_snapshot, extracted_data_tool과 같은
+    특수 도구의 상태 업데이트를 처리합니다.
     """
     tool_calls = state["messages"][-1].tool_calls
     tool_messages = []
     last_error = None
     current_plan_step = state.get("current_plan_step", 0)
 
-    # Prepare a dictionary to hold all state updates from this node
+    # 이 노드에서 발생한 모든 상태 업데이트를 담을 딕셔너리
     state_updates = {}
 
     for tool_call in tool_calls:
         tool_name = tool_call["name"]
         try:
-            output, new_step = await tool_executor(tool_call)
-            if new_step is not None:
-                current_plan_step = new_step
-
-            # --- LOGIC TO HANDLE SPECIAL STATE UPDATES ---
-
-            if tool_name == "browser_snapshot":
-                # 1. Update the 'last_snapshot' field in the state
-                state_updates["last_snapshot"] = str(output)
-                # 2. Return a confirmation message instead of the huge snapshot
-                tool_messages.append(
-                    ToolMessage(content="Snapshot taken and stored in 'last_snapshot'.", tool_call_id=tool_call["id"])
-                )
-            elif tool_name == "extracted_data_tool":
-                # 1. Get the data from the tool's arguments
-                data = tool_call["args"]["data_to_extract"]
-                # 2. Merge it with existing extracted_data
-                # We create a new dict to ensure LangGraph detects the update
-                new_extracted_data = state.get("extracted_data", {}).copy()
-                new_extracted_data.update(data)
-                state_updates["extracted_data"] = new_extracted_data
-                # 3. Return the original confirmation message from the tool
-                tool_messages.append(
-                    ToolMessage(content=str(output), tool_call_id=tool_call["id"])
-                )
+            if tool_call["name"] == "finish_step":
+                current_plan_step += 1 # 현재 단계를 1 증가시킴
+                output = "Step finished. Moving to the next step."
             else:
-                # For all other tools, just append their output
-                tool_messages.append(
-                    ToolMessage(content=str(output), tool_call_id=tool_call["id"])
-                )
+                # 기존 tool_executor 호출 (new_step 반환 값은 사용 안함)
+                output, _ = await tool_executor(tool_call)
+
+                if tool_name == "browser_snapshot":
+                    # 1. 상태의 'last_snapshot' 필드를 업데이트합니다.
+                    state_updates["last_snapshot"] = str(output)
+                    # 2. 거대한 스냅샷 내용 대신 확인 메시지를 반환합니다.
+                    tool_messages.append(
+                        ToolMessage(content="스냅샷을 찍어 'last_snapshot'에 저장했습니다.", tool_call_id=tool_call["id"])
+                    )
+                elif tool_name == "extracted_data_tool":
+                    # 1. 도구의 인자에서 데이터를 가져옵니다.
+                    data = tool_call["args"]["data_to_extract"]
+                    # 2. 기존 extracted_data와 합칩니다.
+                    # LangGraph가 업데이트를 감지하도록 새 딕셔너리를 만듭니다.
+                    new_extracted_data = state.get("extracted_data", {}).copy()
+                    new_extracted_data.update(data)
+                    state_updates["extracted_data"] = new_extracted_data
+                    # 3. 도구가 원래 반환하던 확인 메시지를 사용합니다.
+                    tool_messages.append(
+                        ToolMessage(content=str(output), tool_call_id=tool_call["id"])
+                    )
+                else:
+                    # 다른 모든 도구는 그냥 결과값을 추가합니다.
+                    tool_messages.append(
+                        ToolMessage(content=str(output), tool_call_id=tool_call["id"])
+                    )
 
         except Exception as e:
-            error_message = f"Error executing tool {tool_name}: {e}"
+            error_message = f"도구 {tool_name} 실행 중 오류: {e}"
             console.print(Panel(f"[bold red]{error_message}[/bold red]", border_style="red"))
             tool_messages.append(ToolMessage(content=error_message, tool_call_id=tool_call["id"]))
             last_error = error_message
 
-    # Consolidate all updates to be returned
+    # 반환할 모든 업데이트를 통합합니다.
     final_updates = {
         "messages": tool_messages,
         "last_error": last_error,
         "current_plan_step": int(current_plan_step),
     }
-    final_updates.update(state_updates) # Add snapshot or extracted_data updates
+    final_updates.update(state_updates) # 스냅샷 또는 추출 데이터 업데이트를 추가합니다.
 
     return final_updates
 
@@ -423,20 +431,21 @@ async def report_node(state: AgentState, model):
         "workflow_summary": workflow_summary
     }
 
+
 def should_continue(state: AgentState):
     last_msg = state["messages"][-1]
     # 1) 마지막 AI 메시지가 도구 호출을 포함하면 tools로 이동
     if getattr(last_msg, "tool_calls", None):
         return "tools"
     
-    # 2) 도구 호출이 없더라도 계획이 남아있다면 agent로 다시 루프
+    # 2) 모든 계획이 완료되었으면 종료 (report 노드로 이동)
     plan = state.get("plan", [])
     current_step = int(state.get("current_plan_step", 0) or 0)
-    if plan and current_step < len(plan):
-        return "agent"
+    if not plan or current_step >= len(plan):
+        return "end"
     
-    # 3) 더 진행할 작업이 없으면 종료
-    return "end"
+    # 3) 아직 계획이 남아있다면 agent로 다시 루프
+    return "agent"
 
 def get_command_destination(node_result) -> str:
     # node_result는 노드의 반환값이며, Command일 경우 해당 goto로 라우팅
@@ -450,7 +459,8 @@ async def main():
     client = await get_mcp_client()
     async with client.session("playwright") as session:
         mcp_tools = await load_mcp_tools(session)
-        all_tools = mcp_tools + [think_tool, extracted_data_tool]
+        # all_tools = mcp_tools + [think_tool, extracted_data_tool]
+        all_tools = mcp_tools + [extracted_data_tool, finish_step]
         # all_tools = mcp_tools
         # all_tools = await setup_tools()
         show_tools_table(all_tools)
@@ -464,7 +474,7 @@ async def main():
         console.print(Panel("[bold cyan]Rate limiter configured (~1 request / 4 sec)[/bold cyan]"))
 
         model = init_chat_model(
-            model="google_genai:gemini-2.0-flash",
+            model="google_genai:gemini-2.0-flash-lite",
             rate_limiter=rate_limiter,
             temperature=0
         )
