@@ -80,13 +80,32 @@ def think_tool(reflection: str, current_plan_step: int) -> str:
     console.print(Panel(f"[bold yellow]🤔 Agent's Reflection:[/bold yellow]\n{reflection}", border_style="yellow"))
     return f"Reflection recorded. Currently on plan step {current_plan_step}."
 
+@tool(parse_docstring=True)
+def extracted_data_tool(data_to_extract: dict) -> str:
+    """
+    Extracts and stores key-value data into the agent's state.
+
+    For example:
+    {"flight_price": "$500", "departure_time": "10:00 AM"}
+
+    Args:
+        data_to_extract (dict): A dictionary containing the data to be stored.
+    
+    Returns:
+        A confirmation message indicating that the data has been stored.
+    """
+    console.print(Panel(f"[bold green]📊 Storing data:[/bold green]\n{json.dumps(data_to_extract, indent=2)}", border_style="green"))
+    # The actual data storage will be handled by updating the AgentState,
+    # so we just return a success message here.
+    # The dictionary will be directly updated into the 'extracted_data' field.
+    return "Data has been successfully stored in the agent's state."
 
 # --- 3. 툴 세팅 ---
 async def setup_tools():
     client = await get_mcp_client()
     console.print(Panel("[bold yellow]Getting tools....[/bold yellow]", expand=False))
     mcp_tools = await client.get_tools()   # 동일 세션에서 툴 로드
-    all_tools = mcp_tools + [think_tool]
+    all_tools = mcp_tools + [think_tool, extracted_data_tool]
     return all_tools
 
 def show_tools_table(all_tools) -> List:
@@ -254,9 +273,11 @@ async def agent_node(state: AgentState, model_with_tools):
         max_messages = max(1, max_messages - 1)
         console.print(Panel(f"[bold yellow]🔧 Reducing context to {max_messages} messages due to MAX_TOKENS[/bold yellow]", border_style="yellow"))
     
+    last_snapshot = state.get('last_snapshot')
+    
     recently_executed = []
     recent_messages = messages[-max_messages:]
-
+    
     for i, msg in enumerate(recent_messages):
         is_last_message = (i == len(recent_messages) - 1)
         
@@ -275,9 +296,12 @@ async def agent_node(state: AgentState, model_with_tools):
                 continue # 너무 긴 툴 출력은 제외 (예: browser_snapshot)
             recently_executed.append(f"AI(tool) :  {msg.content}")
     
-
-    
     recent_history = "Below is the recent history:\n\n" + "\n".join(recently_executed)
+    
+    if last_snapshot:
+        console.print(Panel("[bold cyan] injecting snapshot into context...[/bold cyan]", border_style="cyan"))
+        recent_history += f"\n\nHere is the current browser snapshot:\n<snapshot>\n{last_snapshot}\n</snapshot>"
+
     model_input_messages = [
         SystemMessage(content=guidance), 
         SystemMessage(content=command_prompt),
@@ -286,44 +310,118 @@ async def agent_node(state: AgentState, model_with_tools):
     
     response = await model_with_tools.ainvoke(model_input_messages)
     
-    # MAX_TOKENS 이슈가 발생했는지 확인하고 max_messages_for_agent 업데이트
+    # === 반환 값에 last_snapshot 초기화 추가 ===
+    # 스냅샷을 한 번 사용했으므로 상태에서 비워줍니다.
+    updates_to_return = {"messages": [response]}
+    if last_snapshot:
+        updates_to_return["last_snapshot"] = None
+    
+    # MAX_TOKENS 이슈 처리
     if (hasattr(response, 'response_metadata') and 
         response.response_metadata and 
         response.response_metadata.get('finish_reason') == 'MAX_TOKENS'):
         console.print(Panel(f"[bold red]⚠️ MAX_TOKENS detected, will reduce context further next time[/bold red]", border_style="red"))
-        return {"messages": [response], "max_messages_for_agent": max_messages}
+        updates_to_return["max_messages_for_agent"] = max_messages
+        return updates_to_return
     
-    # 성공적으로 응답을 받았으면 메시지 수를 원래대로 복구 (바로 5개로 리셋)
+    # 성공 시 메시지 수 복구
     if max_messages < 5:
         console.print(Panel(f"[bold green]✅ Response successful, resetting context to 5 messages[/bold green]", border_style="green"))
-        return {"messages": [response], "max_messages_for_agent": 5}
+        updates_to_return["max_messages_for_agent"] = 5
+        return updates_to_return
     
-    return {"messages": [response]}
+    return updates_to_return
 
 
 async def tool_node(state: AgentState, tool_executor: ToolExecutor):
+    """
+    Executes tools and handles state updates for special tools like
+    browser_snapshot and extracted_data_tool.
+    """
     tool_calls = state["messages"][-1].tool_calls
     tool_messages = []
-    last_error = None 
+    last_error = None
     current_plan_step = state.get("current_plan_step", 0)
 
+    # Prepare a dictionary to hold all state updates from this node
+    state_updates = {}
+
     for tool_call in tool_calls:
+        tool_name = tool_call["name"]
         try:
             output, new_step = await tool_executor(tool_call)
             if new_step is not None:
                 current_plan_step = new_step
-            tool_messages.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
+
+            # --- LOGIC TO HANDLE SPECIAL STATE UPDATES ---
+
+            if tool_name == "browser_snapshot":
+                # 1. Update the 'last_snapshot' field in the state
+                state_updates["last_snapshot"] = str(output)
+                # 2. Return a confirmation message instead of the huge snapshot
+                tool_messages.append(
+                    ToolMessage(content="Snapshot taken and stored in 'last_snapshot'.", tool_call_id=tool_call["id"])
+                )
+            elif tool_name == "extracted_data_tool":
+                # 1. Get the data from the tool's arguments
+                data = tool_call["args"]["data_to_extract"]
+                # 2. Merge it with existing extracted_data
+                # We create a new dict to ensure LangGraph detects the update
+                new_extracted_data = state.get("extracted_data", {}).copy()
+                new_extracted_data.update(data)
+                state_updates["extracted_data"] = new_extracted_data
+                # 3. Return the original confirmation message from the tool
+                tool_messages.append(
+                    ToolMessage(content=str(output), tool_call_id=tool_call["id"])
+                )
+            else:
+                # For all other tools, just append their output
+                tool_messages.append(
+                    ToolMessage(content=str(output), tool_call_id=tool_call["id"])
+                )
+
         except Exception as e:
-            error_message = f"Error during tool execution: {e}"
+            error_message = f"Error executing tool {tool_name}: {e}"
             console.print(Panel(f"[bold red]{error_message}[/bold red]", border_style="red"))
-            if "Timeout" in str(e):
-                error_message += "\nSuggestion: The page might be slow to load. Consider using 'browser_wait_for' or retrying."
-            elif "not found" in str(e) or "no element" in str(e):
-                error_message += "\nSuggestion: The selector might be incorrect. Use 'browser_snapshot' to re-evaluate the page structure."
             tool_messages.append(ToolMessage(content=error_message, tool_call_id=tool_call["id"]))
             last_error = error_message
-    return {"messages": tool_messages, "last_error": last_error, "current_plan_step": int(current_plan_step)}
 
+    # Consolidate all updates to be returned
+    final_updates = {
+        "messages": tool_messages,
+        "last_error": last_error,
+        "current_plan_step": int(current_plan_step),
+    }
+    final_updates.update(state_updates) # Add snapshot or extracted_data updates
+
+    return final_updates
+
+async def report_node(state: AgentState, model):
+    """
+    Generates a final report based on the executed plan and extracted data.
+    """
+    console.print(Panel("[bold magenta]📊 Generating Report...[/bold magenta]", border_style="magenta"))
+
+    # Prepare the context for the reporting model
+    context = (
+        f"Task: {state.get('task')}\n\n"
+        f"Execution Plan:\n" + "\n".join([f"- {step}" for step in state.get('plan', [])]) + "\n\n"
+        f"Extracted Data:\n{json.dumps(state.get('extracted_data', {}), indent=2)}\n\n"
+        "Please generate a final answer for the user based on the above information. "
+        "Also, provide a brief summary of the workflow."
+    )
+
+    response = await model.ainvoke([HumanMessage(content=context)])
+    
+    # For simplicity, we'll just use the content of the response.
+    # In a more complex scenario, you might want to structure this output.
+    final_answer = response.content
+    workflow_summary = "The task was completed following the generated plan and the necessary data was extracted." # A simplified summary
+
+    return {
+        "final_answer": final_answer,
+        "workflow_summary": workflow_summary
+    }
 
 def should_continue(state: AgentState):
     last_msg = state["messages"][-1]
@@ -352,7 +450,7 @@ async def main():
     client = await get_mcp_client()
     async with client.session("playwright") as session:
         mcp_tools = await load_mcp_tools(session)
-        all_tools = mcp_tools + [think_tool]
+        all_tools = mcp_tools + [think_tool, extracted_data_tool]
         # all_tools = mcp_tools
         # all_tools = await setup_tools()
         show_tools_table(all_tools)
@@ -378,7 +476,8 @@ async def main():
         workflow.add_node("human_approval", human_approval)
         workflow.add_node("agent", partial(agent_node, model_with_tools=model_with_tools))
         workflow.add_node("tools", partial(tool_node, tool_executor=tool_executor))
-        
+        workflow.add_node("report", partial(report_node, model=model))
+
         # workflow.add_edge(START, "clarify_with_user")
         workflow.set_entry_point("clarify_with_user")
         workflow.add_conditional_edges(
@@ -409,10 +508,11 @@ async def main():
             {
                 "tools": "tools",
                 "agent": "agent",
-                "end": END
+                "end": "report"
             }
         )
         workflow.add_edge("tools", "agent")
+        workflow.add_edge("report", END)
         app = workflow.compile()
         console.print(Panel("[bold green]Web Automation Agent is ready.[/bold green]", title="🤖 Agent Ready"))
 
@@ -438,6 +538,7 @@ async def main():
                 "current_plan_step": 0,
                 "plan": [],
                 "max_messages_for_agent": 5,
+                "last_snapshot": None
             }
 
         while True:

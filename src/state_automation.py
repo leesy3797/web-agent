@@ -57,6 +57,9 @@ class AgentState(MessagesState):
     # Maximum number of recent messages to include in agent context (for MAX_TOKENS handling)
     max_messages_for_agent: Optional[int] = 5
 
+    # Stores the last browser snapshot to avoid cluttering the message history.
+    last_snapshot: Optional[str] = None
+    
 # ===== STRUCTURED OUTPUT SCHEMAS =====
 
 class Clarification(BaseModel):
