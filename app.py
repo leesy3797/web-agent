@@ -63,7 +63,7 @@ async def get_mcp_client() -> MultiServerMCPClient:
         console.print("[green]✓ MCP client started successfully![/green]")
     return _client
 
-@tool(parse_docstring=True)
+@tool
 def finish_step(reason: str) -> str:
     """
     Call this tool to signal that the current step of the plan is complete.
