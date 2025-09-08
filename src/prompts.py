@@ -15,7 +15,7 @@ You have access to a set of browser interaction tools and a reflection tool:
 -   `browser_tabs`: For managing browser tabs (list, open, close, switch).
 -   `browser_wait_for`: Use when you need to wait for a specific element or text to appear on the page before proceeding.
 -   `browser_press_key`: For keyboard actions like pressing `Enter` or `Tab`.
--   `think_tool`: **CRITICAL:** This is your reflection and planning tool. Analyze the outcome of your last action and determine your next best move.
+-   `think_tool`: This is your reflection and planning tool. Analyze the outcome of your last action and determine your next best move.
 """
 
 # ---

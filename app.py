@@ -256,7 +256,7 @@ async def agent_node(state: AgentState, model_with_tools):
     
     recently_executed = []
     recent_messages = messages[-max_messages:]
-    
+
     for i, msg in enumerate(recent_messages):
         is_last_message = (i == len(recent_messages) - 1)
         
@@ -353,6 +353,7 @@ async def main():
     async with client.session("playwright") as session:
         mcp_tools = await load_mcp_tools(session)
         all_tools = mcp_tools + [think_tool]
+        # all_tools = mcp_tools
         # all_tools = await setup_tools()
         show_tools_table(all_tools)
         tool_executor = ToolExecutor(all_tools)
