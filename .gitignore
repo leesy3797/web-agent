@@ -5,5 +5,5 @@ test.ipynb
 *.ipynb
 human_approval.py
 *.json
-
+study/
 __pycache__/
